@@ -1,5 +1,6 @@
 import io
-importimport re
+import re
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -17,7 +18,7 @@ st.caption("上传 Preview Raw Data + Tracking Template + Mapping Config，自�
 
 
 # =========================
-# 统一字段定义
+# 标准字段
 # =========================
 STANDARD_COLUMNS = [
     "Media", "Position", "Market", "Date", "Landing page", "Campaign",
@@ -47,7 +48,7 @@ def clean_colnames(df: pd.DataFrame) -> pd.DataFrame:
 
 def safe_get_col(df: pd.DataFrame, target_name: str) -> Optional[pd.Series]:
     """
-    容错取列：忽略大小写、首尾空格、下划线/连字符/多空格差异
+    忽略大小写、空格、下划线、连字符差异来取列
     """
     target_norm = norm_text(target_name)
     for col in df.columns:
@@ -68,6 +69,7 @@ def to_number(v):
             return float(s[:-1]) / 100
         except Exception:
             return np.nan
+
     try:
         return float(s)
     except Exception:
@@ -80,24 +82,9 @@ def safe_div(a, b):
     return a / b
 
 
-def add_kpis(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    if "CTR" not in df.columns:
-        df["CTR"] = np.nan
-    if "CPM" not in df.columns:
-        df["CPM"] = np.nan
-    if "CPC" not in df.columns:
-        df["CPC"] = np.nan
-
-    df["CTR"] = df["CTR"].where(df["CTR"].notna(), df.apply(lambda x: safe_div(x["CLICK"], x["IMP"]), axis=1))
-    df["CPM"] = df["CPM"].where(df["CPM"].notna(), df.apply(lambda x: safe_div(x["Cost"] * 1000, x["IMP"]), axis=1))
-    df["CPC"] = df["CPC"].where(df["CPC"].notna(), df.apply(lambda x: safe_div(x["Cost"], x["CLICK"]), axis=1))
-    return df
-
-
 def allocate_cost_by_imp(df: pd.DataFrame, total_cost) -> pd.DataFrame:
     """
-    如果 raw 没有成本，用 config 中给的总成本，按 IMP 占比分摊
+    如果 raw 中没有 Cost，用 config 中配置的总成本按 IMP 比例分摊
     """
     df = df.copy()
     total_cost = to_number(total_cost)
@@ -114,6 +101,23 @@ def allocate_cost_by_imp(df: pd.DataFrame, total_cost) -> pd.DataFrame:
     return df
 
 
+def add_kpis(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+
+    if "CTR" not in df.columns:
+        df["CTR"] = np.nan
+    if "CPM" not in df.columns:
+        df["CPM"] = np.nan
+    if "CPC" not in df.columns:
+        df["CPC"] = np.nan
+
+    df["CTR"] = df["CTR"].where(df["CTR"].notna(), df.apply(lambda x: safe_div(x["CLICK"], x["IMP"]), axis=1))
+    df["CPM"] = df["CPM"].where(df["CPM"].notna(), df.apply(lambda x: safe_div(x["Cost"] * 1000, x["IMP"]), axis=1))
+    df["CPC"] = df["CPC"].where(df["CPC"].notna(), df.apply(lambda x: safe_div(x["Cost"], x["CLICK"]), axis=1))
+
+    return df
+
+
 def map_market_by_keyword(text: str, market_map_df: pd.DataFrame) -> str:
     txt = str(text)
     for _, row in market_map_df.iterrows():
@@ -126,9 +130,9 @@ def map_market_by_keyword(text: str, market_map_df: pd.DataFrame) -> str:
 
 def read_excel_first_sheet(uploaded_file) -> pd.DataFrame:
     """
-    当前版按第一个 sheet 读取，你这次4个文件都能满足：
-    - wechat / weibo 本身第一张就是数据
-    - douyin feeds / opening 第一张也是 *_Net 数据
+    当前版按第一个 sheet 读取：
+    - 微信 / 微博第一张就是目标数据
+    - 抖音 feeds / opening 第一张也是 *_Net 数据
     """
     data = uploaded_file.getvalue()
     xls = pd.ExcelFile(io.BytesIO(data), engine="openpyxl")
@@ -147,7 +151,6 @@ def load_mapping_config(uploaded_file):
     file_map = clean_colnames(cfg["file_mapping"])
     market_map = clean_colnames(cfg["market_mapping"])
 
-    # 确保列存在
     required_cols = [
         "source_file", "target_sheet", "media_name",
         "position_mode", "position_value",
@@ -165,59 +168,71 @@ def load_mapping_config(uploaded_file):
 def find_rule(file_map_df: pd.DataFrame, source_file_name: str) -> pd.Series:
     matched = file_map_df[file_map_df["source_file"].astype(str) == str(source_file_name)]
     if matched.empty:
-        raise ValueError(f"mapping_config file_mapping 中找不到 source_file = {source_file_name}")
+        raise ValueError(f"mapping_config 的 file_mapping 中找不到 source_file = {source_file_name}")
     return matched.iloc[0]
 
 
 # =========================
-# 各媒体专属解析器
+# 各媒体解析器
 # =========================
 def process_wechat(df: pd.DataFrame, cfg: pd.Series, market_map_df: pd.DataFrame) -> pd.DataFrame:
     """
     适配：
     Prada may issue wechat brand gallery.xlsx
-    字段来自 raw:
+    原始字段：
     日期 / 广告名称 / 花费 / 曝光次数 / 点击次数 / 点击率 / 点赞次数 / 分享次数 / 评论次数 / 下单金额 / 下单次数
     """
     out = pd.DataFrame()
 
-    out["Date"] = safe_get_col(df, "日期")
-    out["Campaign"] = safe_get_col(df, "广告名称")
-    out["Cost"] = safe_get_col(df, "花费").apply(to_number)
-    out["IMP"] = safe_get_col(df, "曝光次数").apply(to_number)
-    out["CLICK"] = safe_get_col(df, "点击次数").apply(to_number)
-    out["CTR"] = safe_get_col(df, "点击率").apply(to_number)
+    date_col = safe_get_col(df, "日期")
+    campaign_col = safe_get_col(df, "广告名称")
+    cost_col = safe_get_col(df, "花费")
+    imp_col = safe_get_col(df, "曝光次数")
+    click_col = safe_get_col(df, "点击次数")
+    ctr_col = safe_get_col(df, "点击率")
+    like_col = safe_get_col(df, "点赞次数")
+    forward_col = safe_get_col(df, "分享次数")
+    comment_col = safe_get_col(df, "评论次数")
+    revenue_col = safe_get_col(df, "下单金额")
+    orders_col = safe_get_col(df, "下单次数")
 
-    out["Like"] = safe_get_col(df, "点赞次数").apply(to_number)
-    out["Forward"] = safe_get_col(df, "分享次数").apply(to_number)
-    out["Comment"] = safe_get_col(df, "评论次数").apply(to_number)
+    out["Date"] = date_col
+    out["Campaign"] = campaign_col
+    out["Cost"] = cost_col.apply(to_number) if cost_col is not None else np.nan
+    out["IMP"] = imp_col.apply(to_number) if imp_col is not None else np.nan
+    out["CLICK"] = click_col.apply(to_number) if click_col is not None else np.nan
+    out["CTR"] = ctr_col.apply(to_number) if ctr_col is not None else np.nan
 
-    out["Revenue"] = safe_get_col(df, "下单金额").apply(to_number)
-    out["Orders"] = safe_get_col(df, "下单次数").apply(to_number)
+    out["Like"] = like_col.apply(to_number) if like_col is not None else np.nan
+    out["Forward"] = forward_col.apply(to_number) if forward_col is not None else np.nan
+    out["Comment"] = comment_col.apply(to_number) if comment_col is not None else np.nan
+
+    out["Revenue"] = revenue_col.apply(to_number) if revenue_col is not None else np.nan
+    out["Orders"] = orders_col.apply(to_number) if orders_col is not None else np.nan
 
     out["ENG"] = out[["Like", "Forward", "Comment"]].fillna(0).sum(axis=1)
 
     out["Media"] = cfg["media_name"]
 
-    # Position 模式
+    # Position
     if str(cfg["position_mode"]).lower() == "fixed":
         out["Position"] = cfg["position_value"]
     else:
-        col = safe_get_col(df, str(cfg["position_value"]))
-        out["Position"] = col if col is not None else "Unknown"
+        raw_pos = safe_get_col(df, str(cfg["position_value"]))
+        out["Position"] = raw_pos if raw_pos is not None else "Unknown"
 
     # Landing page
     out["Landing page"] = cfg["landing_page_default"]
 
-    # Market 模式
+    # Market
     mmode = str(cfg["market_mode"]).lower()
     if mmode == "keyword":
         out["Market"] = out["Campaign"].apply(lambda x: map_market_by_keyword(x, market_map_df))
     elif mmode == "fixed":
         out["Market"] = cfg["market_value"]
     elif mmode == "raw":
-        col = safe_get_col(df, str(cfg["market_value"]))
-        out["Market"] = col if col is not None else "Unknown"
+        raw_market = safe_get_col(df, str(cfg["market_value"]))
+        out["Market"] = raw_market if raw_market is not None else "Unknown"
     else:
         out["Market"] = "Unknown"
 
@@ -227,7 +242,6 @@ def process_wechat(df: pd.DataFrame, cfg: pd.Series, market_map_df: pd.DataFrame
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
     out = add_kpis(out)
 
-    # 补齐标准列
     for c in STANDARD_COLUMNS:
         if c not in out.columns:
             out[c] = np.nan
@@ -240,16 +254,22 @@ def process_douyin(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
     适配：
     Prada may issue douyin feeds.xlsx
     Prada may issue douyin opening.xlsx
+
     原始字段：
     Region / Type / SPID / Website / Channel / Ad Placement / Campaign ID / CampaignName / Date / Impression / Click / CTR
     """
     out = pd.DataFrame()
 
-    out["Date"] = safe_get_col(df, "Date")
-    out["Campaign"] = safe_get_col(df, "CampaignName")
-    out["IMP"] = safe_get_col(df, "Impression").apply(to_number)
-    out["CLICK"] = safe_get_col(df, "Click").apply(to_number)
+    date_col = safe_get_col(df, "Date")
+    camp_col = safe_get_col(df, "CampaignName")
+    imp_col = safe_get_col(df, "Impression")
+    click_col = safe_get_col(df, "Click")
     ctr_col = safe_get_col(df, "CTR")
+
+    out["Date"] = date_col
+    out["Campaign"] = camp_col
+    out["IMP"] = imp_col.apply(to_number) if imp_col is not None else np.nan
+    out["CLICK"] = click_col.apply(to_number) if click_col is not None else np.nan
     out["CTR"] = ctr_col.apply(to_number) if ctr_col is not None else np.nan
 
     out["Media"] = cfg["media_name"]
@@ -258,14 +278,14 @@ def process_douyin(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
     if str(cfg["position_mode"]).lower() == "fixed":
         out["Position"] = cfg["position_value"]
     else:
-        col = safe_get_col(df, str(cfg["position_value"]))
-        out["Position"] = col if col is not None else "Unknown"
+        raw_pos = safe_get_col(df, str(cfg["position_value"]))
+        out["Position"] = raw_pos if raw_pos is not None else "Unknown"
 
     # Market
     mmode = str(cfg["market_mode"]).lower()
     if mmode == "raw":
-        col = safe_get_col(df, str(cfg["market_value"]))
-        out["Market"] = col if col is not None else "Unknown"
+        raw_market = safe_get_col(df, str(cfg["market_value"]))
+        out["Market"] = raw_market if raw_market is not None else "Unknown"
     elif mmode == "fixed":
         out["Market"] = cfg["market_value"]
     else:
@@ -273,7 +293,7 @@ def process_douyin(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
 
     out["Landing page"] = cfg["landing_page_default"]
 
-    # Raw 无这些字段
+    # 这些字段 raw 没有
     out["Like"] = np.nan
     out["Forward"] = np.nan
     out["Comment"] = np.nan
@@ -284,9 +304,9 @@ def process_douyin(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
     # Cost
     out["Cost"] = np.nan
     if str(cfg["cost_mode"]).lower() == "raw":
-        raw_cost_col = safe_get_col(df, "Cost")
-        if raw_cost_col is not None:
-            out["Cost"] = raw_cost_col.apply(to_number)
+        raw_cost = safe_get_col(df, "Cost")
+        if raw_cost is not None:
+            out["Cost"] = raw_cost.apply(to_number)
     elif str(cfg["cost_mode"]).lower() == "allocate_total":
         out = allocate_cost_by_imp(out, cfg["cost_total"])
 
@@ -307,15 +327,22 @@ def process_weibo(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
     """
     适配：
     Prada may issue weibo opening.xlsx
+
     原始字段：
     日期 / 点位 / PV / Click
     """
     out = pd.DataFrame()
 
-    out["Date"] = safe_get_col(df, "日期")
-    out["Position"] = safe_get_col(df, "点位")
-    out["IMP"] = safe_get_col(df, "PV").apply(to_number)
-    out["CLICK"] = safe_get_col(df, "Click").apply(to_number)
+    date_col = safe_get_col(df, "日期")
+    pos_col = safe_get_col(df, "点位")
+    imp_col = safe_get_col(df, "PV")
+    click_col = safe_get_col(df, "Click")
+
+    out["Date"] = date_col
+    out["Position"] = pos_col if pos_col is not None else "Unknown"
+    out["IMP"] = imp_col.apply(to_number) if imp_col is not None else np.nan
+    out["CLICK"] = click_col.apply(to_number) if click_col is not None else np.nan
+    out["CTR"] = out.apply(lambda x: safe_div(x["CLICK"], x["IMP"]), axis=1)
 
     out["Media"] = cfg["media_name"]
 
@@ -324,15 +351,15 @@ def process_weibo(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
     if mmode == "fixed":
         out["Market"] = cfg["market_value"]
     elif mmode == "raw":
-        col = safe_get_col(df, str(cfg["market_value"]))
-        out["Market"] = col if col is not None else "Unknown"
+        raw_market = safe_get_col(df, str(cfg["market_value"]))
+        out["Market"] = raw_market if raw_market is not None else "Unknown"
     else:
         out["Market"] = "Unknown"
 
     out["Landing page"] = cfg["landing_page_default"]
     out["Campaign"] = np.nan
 
-    # 没有互动/转化
+    # 微博没有这些
     out["Like"] = np.nan
     out["Forward"] = np.nan
     out["Comment"] = np.nan
@@ -340,12 +367,10 @@ def process_weibo(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
     out["Revenue"] = np.nan
     out["Orders"] = np.nan
 
-    # Cost
     out["Cost"] = np.nan
     if str(cfg["cost_mode"]).lower() == "allocate_total":
         out = allocate_cost_by_imp(out, cfg["cost_total"])
 
-    out["CTR"] = out.apply(lambda x: safe_div(x["CLICK"], x["IMP"]), axis=1)
     out["source_file"] = cfg["source_file"]
     out["target_sheet"] = cfg["target_sheet"]
 
@@ -360,13 +385,9 @@ def process_weibo(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
 
 
 # =========================
-# Campaign 聚合表（模板复刻基础版）
+# Campaign 汇总页
 # =========================
 def build_campaign_table(all_std: pd.DataFrame) -> pd.DataFrame:
-    """
-    当前版：把全部标准化结果输出成一张标准汇总表写入 Campaign。
-    这是“模板复刻版”的第一阶段。
-    """
     df = all_std.copy()
     df["Date"] = pd.to_datetime(df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
 
@@ -374,6 +395,7 @@ def build_campaign_table(all_std: pd.DataFrame) -> pd.DataFrame:
     value_cols = ["Cost", "IMP", "CLICK", "ENG", "Like", "Forward", "Comment", "Revenue", "Orders"]
 
     agg = df.groupby(group_cols, dropna=False)[value_cols].sum(min_count=1).reset_index()
+
     agg["CTR"] = agg.apply(lambda x: safe_div(x["CLICK"], x["IMP"]), axis=1)
     agg["CPM"] = agg.apply(lambda x: safe_div(x["Cost"] * 1000, x["IMP"]), axis=1)
     agg["CPC"] = agg.apply(lambda x: safe_div(x["Cost"], x["CLICK"]), axis=1)
@@ -387,12 +409,13 @@ def build_campaign_table(all_std: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# 写模板 workbook
+# 写入模板
 # =========================
 def clear_sheet(ws):
     for row in ws.iter_rows():
         for cell in row:
             cell.value = None
+
 
 def write_table(ws, df: pd.DataFrame):
     clear_sheet(ws)
@@ -411,7 +434,7 @@ def write_table(ws, df: pd.DataFrame):
         for c_idx, val in enumerate(row, start=1):
             ws.cell(row=r_idx, column=c_idx, value=None if pd.isna(val) else val)
 
-    # 简单自适应列宽
+    # 简单列宽
     for col_cells in ws.columns:
         letter = col_cells[0].column_letter
         max_len = 0
@@ -419,6 +442,7 @@ def write_table(ws, df: pd.DataFrame):
             if cell.value is not None:
                 max_len = max(max_len, len(str(cell.value)))
         ws.column_dimensions[letter].width = min(max(max_len + 2, 12), 50)
+
 
 def build_output_workbook(template_file, all_std: pd.DataFrame) -> bytes:
     wb = load_workbook(io.BytesIO(template_file.getvalue()))
@@ -433,7 +457,7 @@ def build_output_workbook(template_file, all_std: pd.DataFrame) -> bytes:
         export_df = sub_df.copy()
         export_df["Date"] = pd.to_datetime(export_df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
 
-        # 按模板 sheet 类型决定写哪些列
+        # 微信 detail sheet
         if target_sheet in ["【WeChat Moments】", "【WeChat Banner】"]:
             out = export_df[
                 ["Market", "Date", "Campaign", "Cost", "IMP", "CLICK", "CTR", "Like", "Forward", "Comment", "Revenue", "Orders"]
@@ -443,6 +467,7 @@ def build_output_workbook(template_file, all_std: pd.DataFrame) -> bytes:
                 "点赞次数", "分享次数", "评论次数", "下单金额", "下单次数"
             ]
         else:
+            # Douyin / Weibo detail sheet
             out = export_df[
                 ["Market", "Position", "Campaign", "Date", "IMP", "CLICK", "CTR"]
             ].copy()
@@ -465,7 +490,7 @@ def build_output_workbook(template_file, all_std: pd.DataFrame) -> bytes:
 
 
 # =========================
-# 上传区
+# 页面上传区
 # =========================
 raw_files = st.file_uploader(
     "Upload Raw Data",
@@ -493,9 +518,11 @@ if st.button("Generate Dashboard"):
     if not raw_files:
         st.error("请先上传 Preview Raw Data。")
         st.stop()
+
     if template_file is None:
         st.error("请先上传 Tracking Template。")
         st.stop()
+
     if config_file is None:
         st.error("请先上传 Mapping Config。")
         st.stop()
@@ -516,16 +543,12 @@ if st.button("Generate Dashboard"):
 
             if "wechat" in lower_name or "微信" in lower_name:
                 std_df = process_wechat(raw_df, cfg, market_map_df)
-
-            elif "douyin feeds" in lower_name or ("douyin" in lower_name and "feeds" in lower_name):
+            elif "douyin" in lower_name and "feeds" in lower_name:
                 std_df = process_douyin(raw_df, cfg)
-
-            elif "douyin opening" in lower_name or ("douyin" in lower_name and "opening" in lower_name):
+            elif "douyin" in lower_name and "opening" in lower_name:
                 std_df = process_douyin(raw_df, cfg)
-
             elif "weibo" in lower_name or "微博" in lower_name:
                 std_df = process_weibo(raw_df, cfg)
-
             else:
                 st.warning(f"文件 {f.name} 没有匹配到规则，已跳过。")
                 continue
@@ -548,7 +571,6 @@ if st.button("Generate Dashboard"):
     preview_df["Date"] = pd.to_datetime(preview_df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
     st.dataframe(preview_df, use_container_width=True)
 
-    # 输出
     try:
         output_bytes = build_output_workbook(template_file, all_std)
     except Exception as e:
