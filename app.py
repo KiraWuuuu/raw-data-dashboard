@@ -486,8 +486,8 @@ def read_plan_fixed_template(uploaded_file) -> pd.DataFrame:
 def attach_cost_from_plan(raw_df: pd.DataFrame, plan_df: pd.DataFrame) -> pd.DataFrame:
     """
     成本回填规则：
-    1. 先按 Date + Media + Position 匹配
-    2. 如果是 Weibo，再降级按 Date + Media 匹配
+    1. 通用：先按 Date + Media + Position 匹配
+    2. 微博兜底：如果 still unmatched，则对微博按 raw 实际有数据的日期，把 Package Cost 平分到这些 raw 日期
     """
     if plan_df is None or plan_df.empty:
         return raw_df
@@ -504,13 +504,53 @@ def attach_cost_from_plan(raw_df: pd.DataFrame, plan_df: pd.DataFrame) -> pd.Dat
     pp["Plan_Media_norm"] = pp["Plan_Media"].apply(normalize_media_for_match)
     pp["Plan_Position_norm"] = pp["Plan_Position"].apply(normalize_position_for_match)
 
-    # 先严格匹配：Date + Media + Position
+    # ---------- 1) 先严格匹配：Date + Media + Position ----------
     strict = df.merge(
         pp,
         how="left",
         left_on=["Date", "Media_norm", "Position_norm"],
         right_on=["Date", "Plan_Media_norm", "Plan_Position_norm"]
     )
+
+    strict["Cost"] = strict["Cost"].where(strict["Cost"].notna(), strict["Plan_Cost"])
+
+    # ---------- 2) 微博兜底：按 raw 实际日期平分微博 Package Cost ----------
+    # 只处理当前仍然没有 Cost 的微博行
+    weibo_mask = (strict["Media_norm"] == "weibo") & (strict["Cost"].isna())
+
+    if weibo_mask.any():
+        # 从 plan 里提取微博的总成本（Package Cost拆出的 Plan_Cost 汇总）
+        weibo_plan = pp[pp["Plan_Media_norm"] == "weibo"].copy()
+
+        if not weibo_plan.empty:
+            total_weibo_cost = weibo_plan["Plan_Cost"].sum(skipna=True)
+
+            # raw 里实际存在的微博日期
+            weibo_raw_dates = strict.loc[weibo_mask, "Date"].dropna().unique()
+
+            if len(weibo_raw_dates) > 0 and pd.notna(total_weibo_cost):
+                # 平分到 raw 实际存在的日期上
+                daily_cost = total_weibo_cost / len(weibo_raw_dates)
+
+                strict.loc[weibo_mask, "Cost"] = daily_cost
+
+    # ---------- 清理中间列 ----------
+    drop_cols = [
+        "Media_norm", "Position_norm",
+        "Plan_Media", "Plan_Position", "Plan_Market",
+        "Plan_Cost", "Plan_Media_norm", "Plan_Position_norm"
+    ]
+    strict = strict.drop(columns=drop_cols, errors="ignore")
+
+    # ---------- 回填后重新计算 KPI ----------
+    strict = add_kpis(strict)
+
+    # 保持主列顺序
+    keep_cols = [c for c in STANDARD_COLUMNS if c in strict.columns]
+    extra_cols = [c for c in strict.columns if c not in keep_cols]
+    strict = strict[keep_cols + extra_cols]
+
+    return strict
 
     # 对微博做降级匹配：Date + Media
     no_cost_mask = strict["Cost"].isna() & strict["Plan_Cost"].isna() & (strict["Media_norm"] == "weibo")
