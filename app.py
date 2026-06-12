@@ -137,19 +137,15 @@ def normalize_media_for_match(text: str) -> str:
 def normalize_position_for_match(text: str) -> str:
     t = norm_text(text)
 
-    # 微博开机类统一
     if "微博" in t and ("开机" in t or "报头" in t or "半波纹" in t):
         return "weibo_opening"
 
-    # 抖音开屏
     if ("抖音" in t or "douyin" in t) and ("开屏" in t or "opening" in t):
         return "douyin_opening"
 
-    # 抖音信息流
     if ("抖音" in t or "douyin" in t) and ("信息流" in t or "feed" in t or "feeds" in t):
         return "douyin_feeds"
 
-    # B站
     if "bilibili" in t or "b站" in t or "哔哩哔哩" in t:
         return "bilibili"
 
@@ -286,7 +282,6 @@ def process_douyin(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
 
     out["Landing page"] = cfg["landing_page_default"]
 
-    # 初始保持空，后续由 plan 补
     out["Cost"] = np.nan
     out["Like"] = np.nan
     out["Forward"] = np.nan
@@ -330,7 +325,6 @@ def process_weibo(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
     out["Landing page"] = cfg["landing_page_default"]
     out["Campaign"] = np.nan
 
-    # 初始保持空，后续由 plan 补
     out["Cost"] = np.nan
     out["Like"] = np.nan
     out["Forward"] = np.nan
@@ -400,193 +394,85 @@ def process_bilibili(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
 
 
 # =========================
-# 固定模板排期解析（读取 Package Cost）
+# 固定模板排期解析（只提取媒体总 Package Cost）
 # =========================
-def read_plan_fixed_template(uploaded_file) -> pd.DataFrame:
+def extract_media_package_total(plan_file, target_media_keywords):
     """
-    读取固定模板排期：
-    - 找到包含 Website / Ad Format / Package Cost 的表头行
-    - 用 Package Cost 作为总成本
-    - 根据数字日期列拆成日成本
+    只提取指定媒体的 Package Cost 总额
     """
-    data = uploaded_file.getvalue()
+    data = plan_file.getvalue()
     raw = pd.read_excel(io.BytesIO(data), sheet_name=0, engine="openpyxl", header=None)
     raw = raw.fillna("")
 
-    # 找表头行
     header_row_idx = None
     for i in range(len(raw)):
         row_vals = [str(v).strip() for v in raw.iloc[i].tolist()]
         joined = " | ".join(row_vals)
-        if ("Website" in joined or "网站" in joined) and ("Ad Format" in joined or "广告形式/位置" in joined) and ("Package Cost" in joined or "打包价" in joined):
+        if ("Website" in joined or "网站" in joined) and ("Package Cost" in joined or "打包价" in joined):
             header_row_idx = i
             break
 
     if header_row_idx is None:
-        raise ValueError("排期文件中未找到包含 Website / Ad Format / Package Cost 的表头行")
+        return np.nan
 
     header = [str(v).strip() for v in raw.iloc[header_row_idx].tolist()]
     df = raw.iloc[header_row_idx + 1:].copy()
     df.columns = header
     df = df.reset_index(drop=True)
-    df = clean_colnames(df)
 
-    website_col = "Website" if "Website" in df.columns else "网站"
-    adformat_col = "Ad Format" if "Ad Format" in df.columns else "广告形式/位置"
-    region_col = "Region" if "Region" in df.columns else ("区域" if "区域" in df.columns else None)
+    website_col = "Website" if "Website" in df.columns else ("网站" if "网站" in df.columns else None)
     package_col = "Package Cost" if "Package Cost" in df.columns else ("打包价" if "打包价" in df.columns else None)
 
-    if package_col is None:
-        raise ValueError("排期文件中未找到 Package Cost / 打包价 列")
+    if website_col is None or package_col is None:
+        return np.nan
 
-    day_cols = [c for c in df.columns if str(c).strip().isdigit()]
+    for _, row in df.iterrows():
+        media_text = str(row.get(website_col, "")).strip().lower()
+        package_cost = to_number(row.get(package_col, np.nan))
 
-    rows = []
-
-    for _, r in df.iterrows():
-        media = r.get(website_col, np.nan)
-        placement = r.get(adformat_col, np.nan)
-        region = r.get(region_col, np.nan) if region_col is not None else np.nan
-        package_cost = to_number(r.get(package_col, np.nan))
-
-        if pd.isna(media) or pd.isna(placement) or pd.isna(package_cost):
+        if pd.isna(package_cost):
             continue
 
-        active_days = []
-        for c in day_cols:
-            val = str(r.get(c, "")).strip()
-            if val not in ["", "0", "0.0", "-", "nan"]:
-                active_days.append(int(c))
+        for kw in target_media_keywords:
+            if kw.lower() in media_text:
+                return package_cost
 
-        if not active_days:
-            continue
-
-        # 当前你给的模板对应 2026.04.28-2026.05.11
-        expanded_dates = []
-        for d in active_days:
-            if d >= 28:
-                expanded_dates.append(pd.Timestamp(2026, 4, d))
-            else:
-                expanded_dates.append(pd.Timestamp(2026, 5, d))
-
-        daily_cost = package_cost / len(expanded_dates)
-
-        for dt in expanded_dates:
-            rows.append({
-                "Plan_Media": media,
-                "Plan_Position": placement,
-                "Plan_Market": region,
-                "Date": dt,
-                "Plan_Cost": daily_cost
-            })
-
-    return pd.DataFrame(rows)
+    return np.nan
 
 
-def attach_cost_from_plan(raw_df: pd.DataFrame, plan_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    成本回填规则：
-    1. 通用：先按 Date + Media + Position 匹配
-    2. 微博兜底：如果 still unmatched，则对微博按 raw 实际有数据的日期，把 Package Cost 平分到这些 raw 日期
-    """
-    if plan_df is None or plan_df.empty:
-        return raw_df
+# =========================
+# 微博 Cost 兜底：直接把微博总成本平均分给 raw 中实际的微博行
+# =========================
+def attach_cost_from_plan(raw_df: pd.DataFrame, weibo_package_total=np.nan, douyin_package_total=np.nan, bilibili_package_total=np.nan) -> pd.DataFrame:
+    result = raw_df.copy()
 
-    df = raw_df.copy()
-    pp = plan_df.copy()
+    # 微博
+    weibo_mask = result["Media"].astype(str).str.strip().str.lower().eq("weibo") & result["Cost"].isna()
+    if weibo_mask.any() and pd.notna(weibo_package_total):
+        row_count = int(weibo_mask.sum())
+        if row_count > 0:
+            result.loc[weibo_mask, "Cost"] = float(weibo_package_total) / row_count
 
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
-    pp["Date"] = pd.to_datetime(pp["Date"], errors="coerce")
+    # 如果你未来上传对应 Douyin / Bilibili 排期，也可以打开下面两段
+    douyin_mask = result["Media"].astype(str).str.strip().str.lower().eq("douyin") & result["Cost"].isna()
+    if douyin_mask.any() and pd.notna(douyin_package_total):
+        row_count = int(douyin_mask.sum())
+        if row_count > 0:
+            result.loc[douyin_mask, "Cost"] = float(douyin_package_total) / row_count
 
-    df["Media_norm"] = df["Media"].apply(normalize_media_for_match)
-    df["Position_norm"] = df["Position"].apply(normalize_position_for_match)
+    bili_mask = result["Media"].astype(str).str.strip().str.lower().eq("bilibili") & result["Cost"].isna()
+    if bili_mask.any() and pd.notna(bilibili_package_total):
+        row_count = int(bili_mask.sum())
+        if row_count > 0:
+            result.loc[bili_mask, "Cost"] = float(bilibili_package_total) / row_count
 
-    pp["Plan_Media_norm"] = pp["Plan_Media"].apply(normalize_media_for_match)
-    pp["Plan_Position_norm"] = pp["Plan_Position"].apply(normalize_position_for_match)
+    result = add_kpis(result)
 
-    # ---------- 1) 先严格匹配：Date + Media + Position ----------
-    strict = df.merge(
-        pp,
-        how="left",
-        left_on=["Date", "Media_norm", "Position_norm"],
-        right_on=["Date", "Plan_Media_norm", "Plan_Position_norm"]
-    )
+    keep_cols = [c for c in STANDARD_COLUMNS if c in result.columns]
+    extra_cols = [c for c in result.columns if c not in keep_cols]
+    result = result[keep_cols + extra_cols]
 
-    strict["Cost"] = strict["Cost"].where(strict["Cost"].notna(), strict["Plan_Cost"])
-
-    # ---------- 2) 微博兜底：按 raw 实际日期平分微博 Package Cost ----------
-    # 只处理当前仍然没有 Cost 的微博行
-    weibo_mask = (strict["Media_norm"] == "weibo") & (strict["Cost"].isna())
-
-    if weibo_mask.any():
-        # 从 plan 里提取微博的总成本（Package Cost拆出的 Plan_Cost 汇总）
-        weibo_plan = pp[pp["Plan_Media_norm"] == "weibo"].copy()
-
-        if not weibo_plan.empty:
-            total_weibo_cost = weibo_plan["Plan_Cost"].sum(skipna=True)
-
-            # raw 里实际存在的微博日期
-            weibo_raw_dates = strict.loc[weibo_mask, "Date"].dropna().unique()
-
-            if len(weibo_raw_dates) > 0 and pd.notna(total_weibo_cost):
-                # 平分到 raw 实际存在的日期上
-                daily_cost = total_weibo_cost / len(weibo_raw_dates)
-
-                strict.loc[weibo_mask, "Cost"] = daily_cost
-
-    # ---------- 清理中间列 ----------
-    drop_cols = [
-        "Media_norm", "Position_norm",
-        "Plan_Media", "Plan_Position", "Plan_Market",
-        "Plan_Cost", "Plan_Media_norm", "Plan_Position_norm"
-    ]
-    strict = strict.drop(columns=drop_cols, errors="ignore")
-
-    # ---------- 回填后重新计算 KPI ----------
-    strict = add_kpis(strict)
-
-    # 保持主列顺序
-    keep_cols = [c for c in STANDARD_COLUMNS if c in strict.columns]
-    extra_cols = [c for c in strict.columns if c not in keep_cols]
-    strict = strict[keep_cols + extra_cols]
-
-    return strict
-
-    # 对微博做降级匹配：Date + Media
-    no_cost_mask = strict["Cost"].isna() & strict["Plan_Cost"].isna() & (strict["Media_norm"] == "weibo")
-    if no_cost_mask.any():
-        weibo_raw = strict.loc[no_cost_mask, df.columns].copy()
-        weibo_plan = pp[pp["Plan_Media_norm"] == "weibo"][["Date", "Plan_Media_norm", "Plan_Cost"]].copy()
-
-        relaxed = weibo_raw.merge(
-            weibo_plan,
-            how="left",
-            left_on=["Date", "Media_norm"],
-            right_on=["Date", "Plan_Media_norm"]
-        )
-
-        strict.loc[no_cost_mask, "Plan_Cost"] = relaxed["Plan_Cost"].values
-
-    # 只在原本 Cost 为空时回填排期成本
-    strict["Cost"] = strict["Cost"].where(strict["Cost"].notna(), strict["Plan_Cost"])
-
-    # 清理中间列
-    drop_cols = [
-        "Media_norm", "Position_norm",
-        "Plan_Media", "Plan_Position", "Plan_Market",
-        "Plan_Cost", "Plan_Media_norm", "Plan_Position_norm"
-    ]
-    strict = strict.drop(columns=drop_cols, errors="ignore")
-
-    # 回填后重新算 KPI
-    strict = add_kpis(strict)
-
-    # 保持主列顺序
-    keep_cols = [c for c in STANDARD_COLUMNS if c in strict.columns]
-    extra_cols = [c for c in strict.columns if c not in keep_cols]
-    strict = strict[keep_cols + extra_cols]
-
-    return strict
+    return result
 
 
 # =========================
@@ -614,7 +500,7 @@ def build_campaign_table(all_std: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# 写模板（重建 sheet 避免 merged cell）
+# 写模板（重建 sheet，避免 merged cell）
 # =========================
 def recreate_sheet(wb, sheet_name: str):
     if sheet_name in wb.sheetnames:
@@ -631,31 +517,29 @@ def write_table(ws, df: pd.DataFrame):
     header_fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
     bold_font = Font(bold=True)
 
-    # 写表头
+    # 表头
     for c_idx, col_name in enumerate(df.columns, start=1):
         cell = ws.cell(row=1, column=c_idx, value=col_name)
         cell.fill = header_fill
         cell.font = bold_font
 
-    # 写数据
+    # 数据
     for r_idx, row in enumerate(df.itertuples(index=False), start=2):
         for c_idx, val in enumerate(row, start=1):
             ws.cell(row=r_idx, column=c_idx, value=None if pd.isna(val) else val)
 
-    # ===== 数字格式 =====
+    # 格式
     accounting_format = '¥#,##0.00'
     integer_format = '#,##0'
     decimal_2_format = '0.00'
     percent_format = '0.00%'
 
     format_map = {
-        # 会计
         "Cost": accounting_format,
         "Revenue": accounting_format,
         "花费": accounting_format,
         "下单金额": accounting_format,
 
-        # 千位分隔
         "IMP": integer_format,
         "CLICK": integer_format,
         "ENG": integer_format,
@@ -672,11 +556,9 @@ def write_table(ws, df: pd.DataFrame):
         "评论次数": integer_format,
         "下单次数": integer_format,
 
-        # 两位小数
         "CPM": decimal_2_format,
         "CPC": decimal_2_format,
 
-        # 百分比
         "CTR": percent_format,
         "点击率": percent_format,
     }
@@ -824,19 +706,34 @@ if st.button("Generate Dashboard"):
 
     all_std = pd.concat(all_parts, ignore_index=True)
 
-    # 如果上传了排期文件，则从 Package Cost 补 Cost
+    # 从上传的排期文件中提取各媒体 Package Cost 总额
+    weibo_package_total = np.nan
+    douyin_package_total = np.nan
+    bilibili_package_total = np.nan
+
     if plan_files:
-        plan_parts = []
         for pf in plan_files:
             try:
-                plan_parts.append(read_plan_fixed_template(pf))
+                file_name_lower = pf.name.lower()
+
+                if "weibo" in file_name_lower or "微博" in pf.name:
+                    weibo_package_total = extract_media_package_total(pf, ["微博", "weibo"])
+
+                if "douyin" in file_name_lower or "抖音" in pf.name:
+                    douyin_package_total = extract_media_package_total(pf, ["抖音", "douyin"])
+
+                if "bili" in file_name_lower or "b站" in pf.name or "bilibili" in file_name_lower:
+                    bilibili_package_total = extract_media_package_total(pf, ["哔哩哔哩", "bilibili", "b站"])
             except Exception as e:
                 st.error(f"读取排期文件 {pf.name} 失败：{e}")
                 st.stop()
 
-        if plan_parts:
-            full_plan = pd.concat(plan_parts, ignore_index=True)
-            all_std = attach_cost_from_plan(all_std, full_plan)
+    all_std = attach_cost_from_plan(
+        all_std,
+        weibo_package_total=weibo_package_total,
+        douyin_package_total=douyin_package_total,
+        bilibili_package_total=bilibili_package_total
+    )
 
     st.subheader("Standardized Preview")
     preview_df = all_std.copy()
