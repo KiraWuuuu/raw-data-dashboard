@@ -411,7 +411,7 @@ def extract_period_from_sheet(df_raw: pd.DataFrame):
     """
     从固定模板第一页里找类似 2026.04.28-2026.05.11 的 campaign period
     """
-    pattern = re.compile(r"(\d{4})[./-](\d{2})[./-](\d{2})\s*[-~至]\s*(\d{4})[./-](\d{2})[./-](\d{2})")
+    pattern = re.compile(r"(\d{4})\d{2}\d{2}\s*\d{2}\d{2}")
     for _, row in df_raw.iterrows():
         for cell in row.tolist():
             txt = str(cell)
