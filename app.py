@@ -1,6 +1,6 @@
 import io
 import re
-from typing import Optional, List
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -68,8 +68,7 @@ def to_number(v):
     if isinstance(v, (int, float, np.integer, np.floating)):
         return float(v)
 
-    s = str(v).strip()
-    s = s.replace(",", "").replace("¥", "").replace("￥", "").replace("$", "")
+    s = str(v).strip().replace(",", "").replace("¥", "").replace("￥", "").replace("$", "")
     if s.endswith("%"):
         try:
             return float(s[:-1]) / 100
@@ -137,11 +136,23 @@ def normalize_media_for_match(text: str) -> str:
 
 def normalize_position_for_match(text: str) -> str:
     t = norm_text(text)
-    # 你可以继续扩展这层标准化
-    if "开屏" in t or "opening" in t:
-        return "opening"
-    if "信息流" in t or "feed" in t or "feeds" in t:
-        return "feeds"
+
+    # 微博开机类统一
+    if "微博" in t and ("开机" in t or "报头" in t or "半波纹" in t):
+        return "weibo_opening"
+
+    # 抖音开屏
+    if ("抖音" in t or "douyin" in t) and ("开屏" in t or "opening" in t):
+        return "douyin_opening"
+
+    # 抖音信息流
+    if ("抖音" in t or "douyin" in t) and ("信息流" in t or "feed" in t or "feeds" in t):
+        return "douyin_feeds"
+
+    # B站
+    if "bilibili" in t or "b站" in t or "哔哩哔哩" in t:
+        return "bilibili"
+
     return t
 
 
@@ -200,10 +211,6 @@ def find_rule(file_map_df: pd.DataFrame, source_file_name: str) -> pd.Series:
 # 各媒体解析器
 # =========================
 def process_wechat(df: pd.DataFrame, cfg: pd.Series, market_map_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    微信 raw:
-    日期 / 广告名称 / 花费 / 曝光次数 / 点击次数 / 点击率 / 点赞次数 / 分享次数 / 评论次数 / 下单金额 / 下单次数
-    """
     out = pd.DataFrame(index=df.index)
 
     out["Date"] = get_col_or_nan(df, "日期")
@@ -254,10 +261,6 @@ def process_wechat(df: pd.DataFrame, cfg: pd.Series, market_map_df: pd.DataFrame
 
 
 def process_douyin(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
-    """
-    Douyin feeds / opening raw:
-    Region / Type / SPID / Website / Channel / Ad Placement / Campaign ID / CampaignName / Date / Impression / Click / CTR
-    """
     out = pd.DataFrame(index=df.index)
 
     out["Date"] = get_col_or_nan(df, "Date")
@@ -283,9 +286,8 @@ def process_douyin(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
 
     out["Landing page"] = cfg["landing_page_default"]
 
-    # 先不分摊，后面如果上传排期文件再从 Package Cost 回填
+    # 初始保持空，后续由 plan 补
     out["Cost"] = np.nan
-
     out["Like"] = np.nan
     out["Forward"] = np.nan
     out["Comment"] = np.nan
@@ -307,10 +309,6 @@ def process_douyin(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
 
 
 def process_weibo(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
-    """
-    微博 raw:
-    日期 / 点位 / PV / Click
-    """
     out = pd.DataFrame(index=df.index)
 
     out["Date"] = get_col_or_nan(df, "日期")
@@ -332,7 +330,7 @@ def process_weibo(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
     out["Landing page"] = cfg["landing_page_default"]
     out["Campaign"] = np.nan
 
-    # 先不分摊，后面如果上传排期文件再从 Package Cost 回填
+    # 初始保持空，后续由 plan 补
     out["Cost"] = np.nan
     out["Like"] = np.nan
     out["Forward"] = np.nan
@@ -355,9 +353,6 @@ def process_weibo(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
 
 
 def process_bilibili(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
-    """
-    Bilibili raw（如果你后面加上 B站 raw，可复用与 Douyin 相近的结构）
-    """
     out = pd.DataFrame(index=df.index)
 
     out["Date"] = get_col_or_nan(df, "Date")
@@ -405,38 +400,20 @@ def process_bilibili(df: pd.DataFrame, cfg: pd.Series) -> pd.DataFrame:
 
 
 # =========================
-# 解析固定模板排期（读取 Package Cost）
+# 固定模板排期解析（读取 Package Cost）
 # =========================
-def extract_period_from_sheet(df_raw: pd.DataFrame):
-    """
-    从固定模板第一页里找类似 2026.04.28-2026.05.11 的 campaign period
-    """
-    pattern = re.compile(r"(\d{4})\d{2}\d{2}\s*\d{2}\d{2}")
-    for _, row in df_raw.iterrows():
-        for cell in row.tolist():
-            txt = str(cell)
-            m = pattern.search(txt)
-            if m:
-                y1, mo1, d1, y2, mo2, d2 = m.groups()
-                start = pd.Timestamp(int(y1), int(mo1), int(d1))
-                end = pd.Timestamp(int(y2), int(mo2), int(d2))
-                return start, end
-    return None, None
-
-
 def read_plan_fixed_template(uploaded_file) -> pd.DataFrame:
     """
-    读取固定模板的媒体排期文件：
-    - 找到包含 Website / Ad Format / Package Cost 的英文表头行
-    - 读取后从 Package Cost 取得总成本
-    - 根据日期列（28,29,30,1...11）拆成按天成本
+    读取固定模板排期：
+    - 找到包含 Website / Ad Format / Package Cost 的表头行
+    - 用 Package Cost 作为总成本
+    - 根据数字日期列拆成日成本
     """
     data = uploaded_file.getvalue()
     raw = pd.read_excel(io.BytesIO(data), sheet_name=0, engine="openpyxl", header=None)
     raw = raw.fillna("")
 
-    start_date, end_date = extract_period_from_sheet(raw)
-
+    # 找表头行
     header_row_idx = None
     for i in range(len(raw)):
         row_vals = [str(v).strip() for v in raw.iloc[i].tolist()]
@@ -454,7 +431,6 @@ def read_plan_fixed_template(uploaded_file) -> pd.DataFrame:
     df = df.reset_index(drop=True)
     df = clean_colnames(df)
 
-    # 兼容中英文列名
     website_col = "Website" if "Website" in df.columns else "网站"
     adformat_col = "Ad Format" if "Ad Format" in df.columns else "广告形式/位置"
     region_col = "Region" if "Region" in df.columns else ("区域" if "区域" in df.columns else None)
@@ -463,7 +439,6 @@ def read_plan_fixed_template(uploaded_file) -> pd.DataFrame:
     if package_col is None:
         raise ValueError("排期文件中未找到 Package Cost / 打包价 列")
 
-    # 找日期列：表头是纯数字
     day_cols = [c for c in df.columns if str(c).strip().isdigit()]
 
     rows = []
@@ -486,24 +461,13 @@ def read_plan_fixed_template(uploaded_file) -> pd.DataFrame:
         if not active_days:
             continue
 
-        if start_date is None or end_date is None:
-            # 如果未找到 campaign period，就简单按 2026-04/05 推断（与你当前示例排期一致）
-            expanded_dates = []
-            for d in active_days:
-                if d >= 28:
-                    expanded_dates.append(pd.Timestamp(2026, 4, d))
-                else:
-                    expanded_dates.append(pd.Timestamp(2026, 5, d))
-        else:
-            expanded_dates = []
-            cur = start_date
-            while cur <= end_date:
-                if cur.day in active_days:
-                    expanded_dates.append(cur)
-                cur += pd.Timedelta(days=1)
-
-        if not expanded_dates:
-            continue
+        # 当前你给的模板对应 2026.04.28-2026.05.11
+        expanded_dates = []
+        for d in active_days:
+            if d >= 28:
+                expanded_dates.append(pd.Timestamp(2026, 4, d))
+            else:
+                expanded_dates.append(pd.Timestamp(2026, 5, d))
 
         daily_cost = package_cost / len(expanded_dates)
 
@@ -521,8 +485,9 @@ def read_plan_fixed_template(uploaded_file) -> pd.DataFrame:
 
 def attach_cost_from_plan(raw_df: pd.DataFrame, plan_df: pd.DataFrame) -> pd.DataFrame:
     """
-    用排期里的 Package Cost（拆成日成本后）去补 raw 的 Cost
-    匹配键：Date + Media + Position（标准化后）
+    成本回填规则：
+    1. 先按 Date + Media + Position 匹配
+    2. 如果是 Weibo，再降级按 Date + Media 匹配
     """
     if plan_df is None or plan_df.empty:
         return raw_df
@@ -539,31 +504,49 @@ def attach_cost_from_plan(raw_df: pd.DataFrame, plan_df: pd.DataFrame) -> pd.Dat
     pp["Plan_Media_norm"] = pp["Plan_Media"].apply(normalize_media_for_match)
     pp["Plan_Position_norm"] = pp["Plan_Position"].apply(normalize_position_for_match)
 
-    merged = df.merge(
+    # 先严格匹配：Date + Media + Position
+    strict = df.merge(
         pp,
         how="left",
         left_on=["Date", "Media_norm", "Position_norm"],
         right_on=["Date", "Plan_Media_norm", "Plan_Position_norm"]
     )
 
-    # 只在 raw 原本没有 Cost 时，用排期成本补
-    merged["Cost"] = merged["Cost"].where(merged["Cost"].notna(), merged["Plan_Cost"])
+    # 对微博做降级匹配：Date + Media
+    no_cost_mask = strict["Cost"].isna() & strict["Plan_Cost"].isna() & (strict["Media_norm"] == "weibo")
+    if no_cost_mask.any():
+        weibo_raw = strict.loc[no_cost_mask, df.columns].copy()
+        weibo_plan = pp[pp["Plan_Media_norm"] == "weibo"][["Date", "Plan_Media_norm", "Plan_Cost"]].copy()
 
-    merged = merged.drop(columns=[
+        relaxed = weibo_raw.merge(
+            weibo_plan,
+            how="left",
+            left_on=["Date", "Media_norm"],
+            right_on=["Date", "Plan_Media_norm"]
+        )
+
+        strict.loc[no_cost_mask, "Plan_Cost"] = relaxed["Plan_Cost"].values
+
+    # 只在原本 Cost 为空时回填排期成本
+    strict["Cost"] = strict["Cost"].where(strict["Cost"].notna(), strict["Plan_Cost"])
+
+    # 清理中间列
+    drop_cols = [
         "Media_norm", "Position_norm",
         "Plan_Media", "Plan_Position", "Plan_Market",
         "Plan_Cost", "Plan_Media_norm", "Plan_Position_norm"
-    ], errors="ignore")
+    ]
+    strict = strict.drop(columns=drop_cols, errors="ignore")
 
     # 回填后重新算 KPI
-    merged = add_kpis(merged)
+    strict = add_kpis(strict)
 
-    # 只保留标准列
-    keep_cols = [c for c in STANDARD_COLUMNS if c in merged.columns]
-    extra_cols = [c for c in merged.columns if c not in keep_cols]
-    merged = merged[keep_cols + extra_cols]
+    # 保持主列顺序
+    keep_cols = [c for c in STANDARD_COLUMNS if c in strict.columns]
+    extra_cols = [c for c in strict.columns if c not in keep_cols]
+    strict = strict[keep_cols + extra_cols]
 
-    return merged
+    return strict
 
 
 # =========================
@@ -591,7 +574,7 @@ def build_campaign_table(all_std: pd.DataFrame) -> pd.DataFrame:
 
 
 # =========================
-# 写模板（重建 sheet，避免 merged cell）
+# 写模板（重建 sheet 避免 merged cell）
 # =========================
 def recreate_sheet(wb, sheet_name: str):
     if sheet_name in wb.sheetnames:
