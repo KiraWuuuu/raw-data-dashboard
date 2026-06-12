@@ -411,30 +411,39 @@ def build_campaign_table(all_std: pd.DataFrame) -> pd.DataFrame:
 # =========================
 # 写入模板
 # =========================
-def clear_sheet(ws):
-    for row in ws.iter_rows():
-        for cell in row:
-            cell.value = None
+def recreate_sheet(wb, sheet_name: str):
+    """
+    删除原 sheet，创建一个同名全新 sheet，彻底绕开 merged cell 问题
+    """
+    if sheet_name in wb.sheetnames:
+        old_ws = wb[sheet_name]
+        idx = wb.sheetnames.index(sheet_name)
+        wb.remove(old_ws)
+        new_ws = wb.create_sheet(title=sheet_name, index=idx)
+    else:
+        new_ws = wb.create_sheet(title=sheet_name)
+    return new_ws
 
 
 def write_table(ws, df: pd.DataFrame):
-    clear_sheet(ws)
-
+    """
+    在一个“全新 sheet”里写表，不再清空旧 sheet
+    """
     header_fill = PatternFill(fill_type="solid", fgColor="D9EAF7")
     bold_font = Font(bold=True)
 
-    # header
+    # 写表头
     for c_idx, col_name in enumerate(df.columns, start=1):
         cell = ws.cell(row=1, column=c_idx, value=col_name)
         cell.fill = header_fill
         cell.font = bold_font
 
-    # body
+    # 写数据
     for r_idx, row in enumerate(df.itertuples(index=False), start=2):
         for c_idx, val in enumerate(row, start=1):
             ws.cell(row=r_idx, column=c_idx, value=None if pd.isna(val) else val)
 
-    # 简单列宽
+    # 自动列宽
     for col_cells in ws.columns:
         letter = col_cells[0].column_letter
         max_len = 0
@@ -447,27 +456,23 @@ def write_table(ws, df: pd.DataFrame):
 def build_output_workbook(template_file, all_std: pd.DataFrame) -> bytes:
     wb = load_workbook(io.BytesIO(template_file.getvalue()))
 
-    # 1) 写 detail sheets
+    # 1) detail sheets：直接重建目标 sheet
     for target_sheet, sub_df in all_std.groupby("target_sheet", dropna=False):
         target_sheet = str(target_sheet)
-        if target_sheet not in wb.sheetnames:
-            continue
 
-        ws = wb[target_sheet]
         export_df = sub_df.copy()
         export_df["Date"] = pd.to_datetime(export_df["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
 
-        # 微信 detail sheet
         if target_sheet in ["【WeChat Moments】", "【WeChat Banner】"]:
             out = export_df[
-                ["Market", "Date", "Campaign", "Cost", "IMP", "CLICK", "CTR", "Like", "Forward", "Comment", "Revenue", "Orders"]
+                ["Market", "Date", "Campaign", "Cost", "IMP", "CLICK", "CTR",
+                 "Like", "Forward", "Comment", "Revenue", "Orders"]
             ].copy()
             out.columns = [
                 "Market", "日期", "广告名称", "花费", "曝光次数", "点击次数", "点击率",
                 "点赞次数", "分享次数", "评论次数", "下单金额", "下单次数"
             ]
         else:
-            # Douyin / Weibo detail sheet
             out = export_df[
                 ["Market", "Position", "Campaign", "Date", "IMP", "CLICK", "CTR"]
             ].copy()
@@ -475,7 +480,18 @@ def build_output_workbook(template_file, all_std: pd.DataFrame) -> bytes:
                 "Region", "Ad Placement", "CampaignName", "Date", "Impression", "Click", "CTR"
             ]
 
+        ws = recreate_sheet(wb, target_sheet)
         write_table(ws, out)
+
+    # 2) Campaign 汇总页：也重建
+    campaign_df = build_campaign_table(all_std)
+    ws_campaign = recreate_sheet(wb, "Campaign")
+    write_table(ws_campaign, campaign_df)
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return output.getvalue()
 
     # 2) 写 Campaign 汇总页
     if "Campaign" in wb.sheetnames:
